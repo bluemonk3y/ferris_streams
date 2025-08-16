@@ -106,6 +106,18 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+// Import types from the new execution module
+use crate::ferris::sql::execution::expressions::{
+    ExpressionEvaluator, FunctionEvaluator, add_values, cast_value, divide_values, multiply_values,
+    subtract_values,
+};
+use crate::ferris::sql::execution::groupby::{GroupAccumulator, GroupByProcessor, GroupByState};
+use crate::ferris::sql::execution::joins::JoinProcessor;
+use crate::ferris::sql::execution::types::{
+    ExecutionMessage, FieldValue, HeaderMutation, HeaderOperation, StreamRecord,
+};
+use crate::ferris::sql::execution::windows::{WindowProcessor, WindowState};
+
 pub struct StreamExecutionEngine {
     active_queries: HashMap<String, QueryExecution>,
     message_sender: mpsc::Sender<ExecutionMessage>,
@@ -121,167 +133,6 @@ pub struct StreamExecutionEngine {
 // CORE DATA TYPES AND STRUCTURES
 // =============================================================================
 
-/// State for tracking GROUP BY aggregations across streaming records
-#[derive(Debug, Clone)]
-pub struct GroupByState {
-    /// Map of group keys to their accumulated state
-    groups: HashMap<Vec<String>, GroupAccumulator>,
-    /// The GROUP BY expressions for this state
-    group_expressions: Vec<Expr>,
-    /// The SELECT fields to compute for each group
-    select_fields: Vec<SelectField>,
-    /// Optional HAVING clause
-    having_clause: Option<Expr>,
-}
-
-/// Accumulator for a single group's aggregate state
-#[derive(Debug, Clone)]
-pub struct GroupAccumulator {
-    /// Count of records in this group
-    count: u64,
-    /// Count of non-NULL values for COUNT(column) aggregates (field_name -> count)
-    non_null_counts: HashMap<String, u64>,
-    /// Sum values for SUM() aggregates (field_name -> sum)
-    sums: HashMap<String, f64>,
-    /// Values for MIN() aggregates (field_name -> min_value)
-    mins: HashMap<String, FieldValue>,
-    /// Values for MAX() aggregates (field_name -> max_value)
-    maxs: HashMap<String, FieldValue>,
-    /// Values for statistical aggregates (field_name -> [values])
-    numeric_values: HashMap<String, Vec<f64>>,
-    /// First values for FIRST() aggregates
-    first_values: HashMap<String, FieldValue>,
-    /// Last values for LAST() aggregates (updated on each record)
-    last_values: HashMap<String, FieldValue>,
-    /// String values for STRING_AGG
-    string_values: HashMap<String, Vec<String>>,
-    /// Distinct values for COUNT_DISTINCT
-    distinct_values: HashMap<String, std::collections::HashSet<String>>,
-    /// Sample record for non-aggregate fields (takes first record's values)
-    sample_record: Option<StreamRecord>,
-}
-
-#[derive(Debug)]
-pub enum ExecutionMessage {
-    StartJob {
-        job_id: String,
-        query: StreamingQuery,
-    },
-    StopJob {
-        job_id: String,
-    },
-    ProcessRecord {
-        stream_name: String,
-        record: StreamRecord,
-    },
-    QueryResult {
-        query_id: String,
-        result: StreamRecord,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct StreamRecord {
-    pub fields: HashMap<String, FieldValue>,
-    pub timestamp: i64,
-    pub offset: i64,
-    pub partition: i32,
-    pub headers: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct HeaderMutation {
-    pub operation: HeaderOperation,
-    pub key: String,
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub enum HeaderOperation {
-    Set,
-    Remove,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum FieldValue {
-    Integer(i64),
-    Float(f64),
-    String(String),
-    Boolean(bool),
-    Null,
-    /// Date type (YYYY-MM-DD)
-    Date(NaiveDate),
-    /// Timestamp type (YYYY-MM-DD HH:MM:SS[.nnn])
-    Timestamp(NaiveDateTime),
-    /// Decimal type for precise arithmetic
-    Decimal(Decimal),
-    /// Array of values - all elements must be the same type
-    Array(Vec<FieldValue>),
-    /// Map of key-value pairs - keys must be strings
-    Map(HashMap<String, FieldValue>),
-    /// Structured data with named fields
-    Struct(HashMap<String, FieldValue>),
-}
-
-impl FieldValue {
-    /// Get the type name for error messages
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            FieldValue::Integer(_) => "INTEGER",
-            FieldValue::Float(_) => "FLOAT",
-            FieldValue::String(_) => "STRING",
-            FieldValue::Boolean(_) => "BOOLEAN",
-            FieldValue::Null => "NULL",
-            FieldValue::Date(_) => "DATE",
-            FieldValue::Timestamp(_) => "TIMESTAMP",
-            FieldValue::Decimal(_) => "DECIMAL",
-            FieldValue::Array(_) => "ARRAY",
-            FieldValue::Map(_) => "MAP",
-            FieldValue::Struct(_) => "STRUCT",
-        }
-    }
-
-    /// Check if this value is numeric
-    pub fn is_numeric(&self) -> bool {
-        matches!(
-            self,
-            FieldValue::Integer(_) | FieldValue::Float(_) | FieldValue::Decimal(_)
-        )
-    }
-
-    /// Convert to string representation for display
-    pub fn to_display_string(&self) -> String {
-        match self {
-            FieldValue::Integer(i) => i.to_string(),
-            FieldValue::Float(f) => f.to_string(),
-            FieldValue::String(s) => s.clone(),
-            FieldValue::Boolean(b) => b.to_string(),
-            FieldValue::Null => "NULL".to_string(),
-            FieldValue::Date(d) => d.format("%Y-%m-%d").to_string(),
-            FieldValue::Timestamp(ts) => ts.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
-            FieldValue::Decimal(dec) => dec.to_string(),
-            FieldValue::Array(arr) => {
-                let elements: Vec<String> = arr.iter().map(|v| v.to_display_string()).collect();
-                format!("[{}]", elements.join(", "))
-            }
-            FieldValue::Map(map) => {
-                let pairs: Vec<String> = map
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.to_display_string()))
-                    .collect();
-                format!("{{{}}}", pairs.join(", "))
-            }
-            FieldValue::Struct(fields) => {
-                let field_strs: Vec<String> = fields
-                    .iter()
-                    .map(|(name, value)| format!("{}: {}", name, value.to_display_string()))
-                    .collect();
-                format!("{{{}}}", field_strs.join(", "))
-            }
-        }
-    }
-}
-
 pub struct QueryExecution {
     query: StreamingQuery,
     state: ExecutionState,
@@ -295,13 +146,6 @@ enum ExecutionState {
     Paused,
     Stopped,
     Error(String),
-}
-
-#[derive(Debug)]
-struct WindowState {
-    window_spec: WindowSpec,
-    buffer: Vec<StreamRecord>,
-    last_emit: i64,
 }
 
 // =============================================================================
@@ -399,11 +243,7 @@ impl StreamExecutionEngine {
             // Initialize window state if needed for this query
             let query_id = "execute_query".to_string();
             if !self.active_queries.contains_key(&query_id) {
-                let window_state = Some(WindowState {
-                    window_spec: window_spec.clone(),
-                    buffer: Vec::new(),
-                    last_emit: 0,
-                });
+                let window_state = Some(WindowState::new(window_spec.clone()));
 
                 let execution = QueryExecution {
                     query: query.clone(),
@@ -529,13 +369,9 @@ impl StreamExecutionEngine {
         query: StreamingQuery,
     ) -> Result<(), SqlError> {
         let window_state = match &query {
-            StreamingQuery::Select { window, .. } => {
-                window.as_ref().map(|window_spec| WindowState {
-                    window_spec: window_spec.clone(),
-                    buffer: Vec::new(),
-                    last_emit: 0,
-                })
-            }
+            StreamingQuery::Select { window, .. } => window
+                .as_ref()
+                .map(|window_spec| WindowState::new(window_spec.clone())),
             _ => None,
         };
 
@@ -723,7 +559,7 @@ impl StreamExecutionEngine {
                 // Handle JOINs first (if any)
                 let mut joined_record = record.clone();
                 if let Some(join_clauses) = joins {
-                    joined_record = self.process_joins(&joined_record, join_clauses)?;
+                    joined_record = JoinProcessor::process_joins(&joined_record, join_clauses)?;
                 }
 
                 // Apply WHERE clause
@@ -1807,6 +1643,14 @@ impl StreamExecutionEngine {
         left: &FieldValue,
         right: &FieldValue,
     ) -> Result<FieldValue, SqlError> {
+        add_values(left, right)
+    }
+
+    pub fn add_values_original(
+        &self,
+        left: &FieldValue,
+        right: &FieldValue,
+    ) -> Result<FieldValue, SqlError> {
         match (left, right) {
             (FieldValue::Integer(a), FieldValue::Integer(b)) => Ok(FieldValue::Integer(a + b)),
             (FieldValue::Float(a), FieldValue::Float(b)) => Ok(FieldValue::Float(a + b)),
@@ -1821,6 +1665,14 @@ impl StreamExecutionEngine {
     }
 
     pub fn subtract_values(
+        &self,
+        left: &FieldValue,
+        right: &FieldValue,
+    ) -> Result<FieldValue, SqlError> {
+        subtract_values(left, right)
+    }
+
+    pub fn subtract_values_original(
         &self,
         left: &FieldValue,
         right: &FieldValue,
@@ -1843,6 +1695,14 @@ impl StreamExecutionEngine {
         left: &FieldValue,
         right: &FieldValue,
     ) -> Result<FieldValue, SqlError> {
+        multiply_values(left, right)
+    }
+
+    pub fn multiply_values_original(
+        &self,
+        left: &FieldValue,
+        right: &FieldValue,
+    ) -> Result<FieldValue, SqlError> {
         match (left, right) {
             (FieldValue::Integer(a), FieldValue::Integer(b)) => Ok(FieldValue::Integer(a * b)),
             (FieldValue::Float(a), FieldValue::Float(b)) => Ok(FieldValue::Float(a * b)),
@@ -1857,6 +1717,14 @@ impl StreamExecutionEngine {
     }
 
     pub fn divide_values(
+        &self,
+        left: &FieldValue,
+        right: &FieldValue,
+    ) -> Result<FieldValue, SqlError> {
+        divide_values(left, right)
+    }
+
+    pub fn divide_values_original(
         &self,
         left: &FieldValue,
         right: &FieldValue,
@@ -3932,6 +3800,14 @@ impl StreamExecutionEngine {
     }
 
     pub fn cast_value(&self, value: FieldValue, target_type: &str) -> Result<FieldValue, SqlError> {
+        cast_value(value, target_type)
+    }
+
+    pub fn cast_value_original(
+        &self,
+        value: FieldValue,
+        target_type: &str,
+    ) -> Result<FieldValue, SqlError> {
         match target_type {
             "INTEGER" | "INT" => match value {
                 FieldValue::Integer(i) => Ok(FieldValue::Integer(i)),
@@ -4926,7 +4802,7 @@ impl StreamExecutionEngine {
                 // Add record to buffer first
                 if let Some(execution) = self.active_queries.get_mut(query_id) {
                     if let Some(state) = execution.window_state.as_mut() {
-                        state.buffer.push(record.clone());
+                        let _ = state.add_record(record.clone());
                     }
                 }
 
@@ -4946,7 +4822,10 @@ impl StreamExecutionEngine {
                     let (last_emit_time, buffer) =
                         if let Some(execution) = self.active_queries.get(query_id) {
                             if let Some(state) = &execution.window_state {
-                                (state.last_emit, state.buffer.clone())
+                                (
+                                    state.last_emit,
+                                    state.get_window_records().iter().cloned().collect(),
+                                )
                             } else {
                                 (0, Vec::new())
                             }
